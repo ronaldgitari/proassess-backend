@@ -174,6 +174,8 @@ alembic upgrade head
 
 ## Running Tests
 
+> **Note:** A `tests/` directory does not exist yet. Create it and add your test files before running the command below.
+
 ```bash
 pip install pytest pytest-asyncio httpx
 pytest tests/ -v
