@@ -190,7 +190,7 @@ Re-exports routers from root-level `auth.py`, `assessments.py`, `knowledge.py`, 
 9. **Chroma volume mount** — was `/chroma/.chroma` (wrong); corrected to `/chroma/chroma` in `docker-compose.yml`; embeddings now persist across container restarts
 10. **`source_id` in `AssessmentCancelRequest`** — was erroneously required; removed
 11. **`UserOut.full_name`** — backend sends `name` but frontend expected `full_name`; added model_validator to populate `full_name` from `name`
-12. **passlib + bcrypt 4.x** — pinned `bcrypt==4.0.1` in requirements.txt
+12. **passlib dropped → direct `bcrypt`** — `services/auth_service.py` now hashes/verifies with the `bcrypt` library directly (`hash_password`/`verify_password`, truncating to 72 bytes — the bcrypt limit). passlib was removed (unmaintained; it imported the deprecated stdlib `crypt`, removed in Python 3.13, which raised a `DeprecationWarning`). Output is standard `$2b$` bcrypt, so **passwords hashed by the old passlib path still verify** (confirmed: existing logins work). `bcrypt==4.0.1` stays pinned; `passlib[bcrypt]` removed from requirements.
 13. **Chroma filter format** — ChromaDB 0.5.x requires `{"field": {"$eq": "value"}}`; fixed in `dense_search()`
 
 14. **Question generation timeout for >10 questions** — single GPT call for all N questions truncated/timed out. Fixed by batching in groups of `BATCH_SIZE=10` (`rag/augmentor.py`), adding `request_timeout=120` per call, and extending the generation-status fail window from 300s → 600s
@@ -477,8 +477,8 @@ A capability-based permission layer (configurable security groups), **additive o
 2. **S3/MinIO upload** — `knowledge.py` indexer processes files in-memory only; files not stored to MinIO (TODO comment in knowledge.py)
 3. ~~**`_verify_user_is_target`** stub~~ ✅ **IMPLEMENTED** — take-time gate in `start_assessment`: staff may only begin an assessment they're covered by (organisation → any org user; department → via `user_departments`; individuals → exact id match). 403 otherwise; HR/admins bypass; fails closed if no targets. `/available` list mirrors the same logic (batched query) so the list and the gate agree
 4. **Profile picture storage** — base64 in localStorage, keyed per-user (`profile_photo_<userId>`); frontend-only, not persisted to backend/S3, so it doesn't follow a user to another device
-5. **No test suite** — `pytest tests/` referenced in README but `tests/` directory doesn't exist
-6. **seed.py** uses `bcrypt` directly (not passlib) due to version incompatibility — keep as-is
+5. **Test suite — Phase 1 (unit) DONE; Phases 2–3 pending.** `tests/unit/` has 37 pure-logic tests (evaluator/MCQ + personality, the permissions resolver, schema validators, JSON extractors, `spread_correct_answers`, `_to_text`, grader fail-open, `iso_utc`) — no DB/network, OpenAI/Chroma mocked via `tests/conftest.py` (`make_fake_chat`/`fake_chat`). Config in `pytest.ini` (`asyncio_mode=auto`); deps in `requirements-dev.txt`. **Run:** `docker compose exec api pip install -r requirements-dev.txt && docker compose exec api python -m pytest tests/unit`. **Pending:** Phase 2 = API integration (test Postgres + mocked AI, covering auth/RBAC/lifecycle/submit/review/groups) which would replace the manual curl verification; Phase 3 = frontend (Vitest/RTL); CI (GitHub Actions). See the testing discussion for the staged plan.
+6. **seed.py** uses `bcrypt` directly — now consistent with `auth_service.py`, which also dropped passlib for direct bcrypt (see Bug Fix #12)
 7. **Dark mode partial** — `.dark` overrides in `globals.css` cover core classes; LM/HR pages not fully dark-mode styled (staff pages are)
 8. **Personality dedup is exact-match only** — normalized string comparison catches identical/near-identical statements but not semantic paraphrases; embedding-based similarity was avoided to keep personality out of the vector pipeline
 9. **Personality `ALTER TYPE` is manual on existing DBs** — fresh DBs via `create_all` are fine; existing DBs need the one-time `ALTER TYPE questiontype ADD VALUE 'PERSONALITY'` (see Personality section / migration 0002)
@@ -498,6 +498,28 @@ The user manual's "Known limitations & roadmap" maps to the canonical items abov
 - **Observability streaming** (#11) — live-tail polls the DB every 1s; event-driven push (broker/WebSocket) is the next step.
 - **Profile photos** (#4) — per-user localStorage, not synced to the backend.
 - **Automated tests** (#5) — no formal suite yet.
+
+---
+
+## Session Handoff — Next Phases & Open Threads (pick up here)
+
+### ⚠️ Uncommitted on `proassess-backend` (commit first)
+- **Phase-1 unit test suite** (`tests/`, `tests/conftest.py`, `pytest.ini`, `requirements-dev.txt`) and the **passlib→bcrypt** swap (`services/auth_service.py`, `requirements.txt`). Suggested commit: *"Add unit test suite + drop passlib for direct bcrypt"*.
+- `requirements.txt` changed → run `docker compose build api` to bake the slimmer deps (running container is fine as-is — bcrypt was already installed). After a rebuild, re-install test deps: `docker compose exec api pip install -r requirements-dev.txt`.
+
+### Testing — remaining phases (Phase 1 DONE; see Known Issues #5)
+- **Phase 2 — API integration (highest regression value; replaces the manual curl checks).** App via `httpx.ASGITransport`; override `get_db` to a test session on a **throwaway Postgres** (real PG required — JSONB/native enums/pgvector; SQLite won't work); per-test transaction-rollback isolation. **Mock the AI seam** (`monkeypatch` `_call_gpt`/`ChatOpenAI.ainvoke`, Chroma `similarity_search_*`, `rag.web_research.web_search`) — reuse `tests/conftest.py`'s `make_fake_chat`. Fixtures: org + `ensure_default_groups` + one user per role (mirror `seed.py`). **Cover:** auth + `/auth/me` permissions; RBAC 403s (LM read-only KB, dept-restricted targeting, staff blocked); create→deploy→start→submit→feedback; scenario submit→`pending_review`→approve→`evaluated`; groups CRUD + membership/override changing effective perms; `generation-status` insufficient_context. Aim ~60–70% on `services/` + routers.
+- **Phase 3 — frontend.** Vitest + React Testing Library for `can()` gating + key components (assessment bar chart, case panel, idle-logout); keep `tsc --noEmit` + `eslint` as the cheap first gate.
+- **CI.** GitHub Actions on PR: a Postgres service container + `pytest` (unit+integration) + frontend tsc/lint/vitest.
+
+### Other open threads
+- **Manual diagrams not regenerated (v1.1):** Fig 2 (roles) doesn't show security groups; Fig 6 (RAG) doesn't show the grade step. Edit `manual_build/make_diagrams.py` (matplotlib) + rebuild to refresh them.
+- Roadmap leftovers: MinIO object storage (#2), observability event-driven push (#11), profile-photo backend sync (#4).
+
+### Environment state (demo DB) — fresh sessions should know
+- Stack is running (`docker compose` + `npm run dev`); `proassess.bat stop` shuts it down. `proassess.bat reload` force-recreates the API after `.env` edits.
+- **`staff4@acme.com` is promoted to `system_admin`** (for `/ops`). **`lm.sales@acme.com` has `force_password_change` set** (its password was reset during testing — it can NOT log in with `Password123!`; reset via SQL or the HR UI if you need the second LM).
+- Both repos pushed: `proassess-backend` (main) + `proassess-frontend` (**private**, main) — except the uncommitted backend changes above. Tavily `WEB_SEARCH_API_KEY` is live in `.env` (gitignored).
 
 ---
 

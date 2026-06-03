@@ -7,7 +7,7 @@ from uuid import UUID
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from jose import JWTError, jwt
-from passlib.context import CryptContext
+import bcrypt
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
@@ -15,7 +15,10 @@ from config import settings
 from database import get_db
 from models import User, UserRole
 
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+# bcrypt hashes only the first 72 bytes of a password (algorithm limit); we truncate
+# (matching passlib's prior behaviour) so longer inputs don't error. Output is standard
+# $2b$ bcrypt, so any password hashed previously via passlib still verifies here.
+_BCRYPT_MAX_BYTES = 72
 bearer_scheme = HTTPBearer()
 
 
@@ -24,11 +27,14 @@ bearer_scheme = HTTPBearer()
 # ─────────────────────────────────────────────────────────────────
 
 def hash_password(plain: str) -> str:
-    return pwd_context.hash(plain)
+    return bcrypt.hashpw(plain.encode("utf-8")[:_BCRYPT_MAX_BYTES], bcrypt.gensalt()).decode("utf-8")
 
 
 def verify_password(plain: str, hashed: str) -> bool:
-    return pwd_context.verify(plain, hashed)
+    try:
+        return bcrypt.checkpw(plain.encode("utf-8")[:_BCRYPT_MAX_BYTES], hashed.encode("utf-8"))
+    except (ValueError, TypeError):
+        return False
 
 
 # ─────────────────────────────────────────────────────────────────
