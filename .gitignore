@@ -1,0 +1,35 @@
+# ── Secrets / environment ──
+.env
+.env.*
+*.bak
+config.py.bak
+
+# ── Python ──
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+
+# ── Alembic local ──
+# (migrations are tracked; only ignore local caches)
+
+# ── OS / editor ──
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# ── Data / volumes (if ever created locally) ──
+*.sqlite3
+
+# ── Node (manual-generation tooling: docx-js) ──
+node_modules/
+package-lock.json
+
+# ── Sandbox scratch / stray exports ──
+mnt/
+/.docx
+_*.json
+_aid_*.txt

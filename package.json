@@ -1,0 +1,6 @@
+{
+  "dependencies": {
+    "@monaco-editor/react": "^4.7.0",
+    "docx": "^9.7.1"
+  }
+}
