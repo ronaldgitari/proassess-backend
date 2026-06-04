@@ -171,6 +171,32 @@ async def seed(db: AsyncSession) -> None:
             joined_at=now(),
         ))
 
+    # ── Capability-group memberships (Ops / Line Managers / People & Culture) ──
+    # Mirror each user's role into the matching capability group (created by
+    # `ensure_default_groups`) so the security-groups admin UI shows real members
+    # and permissions flow through groups — role defaults remain the fallback.
+    # Staff map to no capability group.
+    print("Assigning users to capability groups …")
+    from sqlalchemy import select
+    role_to_slug = {
+        UserRole.SYSTEM_ADMIN: "ops",
+        UserRole.HR_ADMIN:     "people-culture",
+        UserRole.LINE_MANAGER: "line-managers",
+    }
+    cap_groups = {
+        g.slug: g for g in (await db.execute(
+            select(SecurityGroup).where(
+                SecurityGroup.org_id == org.id,
+                SecurityGroup.slug.in_(list(role_to_slug.values())),
+            )
+        )).scalars().all()
+    }
+    for u in all_users:
+        slug = role_to_slug.get(u.role)
+        grp = cap_groups.get(slug) if slug else None
+        if grp is not None:
+            db.add(GroupMembership(user_id=u.id, group_id=grp.id, joined_at=now()))
+
     await db.commit()
     print("\n✓ Seed complete.\n")
     print("Login credentials (password: Password123!):")

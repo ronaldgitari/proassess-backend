@@ -2,7 +2,9 @@
 Ops / system-process observability API.
 
 Exposes pipeline runs (generation, indexing, evaluation) and their phased
-steps for the System Operations dashboard. Restricted to system_admin.
+steps for the System Operations dashboard. Gated on the `system.view`
+capability (system_admin by role default, or any user in a group granting it,
+e.g. Ops) — matches the nav tab + the /ops page guard.
 
 Endpoints:
   GET /ops/runs              — recent runs with step summary
@@ -21,8 +23,7 @@ from sqlalchemy import select, func
 
 from database import get_db, AsyncSessionLocal
 from models import PipelineRun, PipelineStep, PipelineSpan, User, Assessment, KnowledgeSource, StaffAssessment
-from services.auth_service import require_system_admin, get_user_from_token
-from models import UserRole
+from services.auth_service import require_permission, has_permission, get_user_from_token
 from timeutil import iso_utc
 
 router = APIRouter(prefix="/ops", tags=["ops"])
@@ -137,7 +138,7 @@ async def list_runs(
     limit: int = Query(30, ge=1, le=200),
     kind: str | None = None,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(require_system_admin),
+    current_user: User = Depends(require_permission("system.view")),
 ):
     q = select(PipelineRun).order_by(PipelineRun.started_at.desc()).limit(limit)
     if kind:
@@ -169,7 +170,7 @@ async def list_runs(
 async def get_run(
     run_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(require_system_admin),
+    current_user: User = Depends(require_permission("system.view")),
 ):
     run = (await db.execute(select(PipelineRun).where(PipelineRun.id == run_id))).scalar_one_or_none()
     if not run:
@@ -184,7 +185,7 @@ async def get_run(
 async def get_capsule(
     run_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(require_system_admin),
+    current_user: User = Depends(require_permission("system.view")),
 ):
     """
     Log capsule for one transaction (a pipeline run): metadata header +
@@ -270,7 +271,7 @@ async def stream_run(
     # Auth via query-param token (EventSource limitation)
     async with AsyncSessionLocal() as db:
         user = await get_user_from_token(token, db)
-        if user.role != UserRole.SYSTEM_ADMIN:
+        if not await has_permission(user, "system.view", db):
             raise HTTPException(403, "Insufficient permissions")
 
     async def event_gen():
