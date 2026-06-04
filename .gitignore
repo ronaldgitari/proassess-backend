@@ -33,3 +33,7 @@ mnt/
 /.docx
 _*.json
 _aid_*.txt
+
+# ── Claude Code (machine-local agent settings) ──
+.claude/settings.local.json
+.claude/scheduled_tasks.lock
