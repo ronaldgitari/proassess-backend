@@ -157,6 +157,7 @@ Re-exports routers from root-level `auth.py`, `assessments.py`, `knowledge.py`, 
 - `GET /assessment-averages/{id}/scores` — per-staff scores for one assessment, highest→lowest: `{name, created_at, scores:[{staff_name, score_pct, submitted_at}]}`
 - `GET /staff/{id}/profile` — full staff profile (HR/admin OR the staff's line manager): profile details + personality type/summary, scored results, strengths/developing/weaknesses skill bands
 - `GET /staff-assessment/{id}/feedback` — admin-scoped per-question feedback for one completed scored attempt (HR/admin OR the assessed user's line manager). Mirrors the staff feedback shape but bypasses the staff-only ownership check. Powers the expandable result rows on the staff-profile page
+- `GET /assessments` — every org assessment with resolved `deployed_to` (name – department), `created_by`, status, `created_at`; newest first. Powers the clickable dashboard tiles → `/hr/assessments`
 
 ### Ops / System Processes (`/api/v1/ops`) — `system.view` capability
 **Gated on the `system.view` permission** (was role `system_admin`; changed so an HR_ADMIN/other user added to the **Ops** group — which grants `system.view` — can reach it). All `/ops` endpoints use `require_permission("system.view")`; the SSE `/stream` checks `has_permission(user, "system.view")`; the frontend `/ops` page guards on `can("system.view")` and the nav tab already did — all three now agree. `system_admin` still qualifies via its role-default `system.view`.
@@ -166,6 +167,9 @@ Re-exports routers from root-level `auth.py`, `assessments.py`, `knowledge.py`, 
 | GET | `/runs/{id}` | Single run + ordered steps |
 | GET | `/runs/{id}/capsule` | **Log capsule** — transaction trace: metadata (services, origin/server IP, system id, start + last-action timestamps) + the run's logs grouped by backing service |
 | GET | `/runs/{id}/stream?token=` | **SSE live-tail** — server polls DB each 1s, pushes run+steps on change until finished. Auth via `token` query param (EventSource can't send headers) |
+| GET | `/metrics` | **Platform Health** snapshot: DB-pool utilization, api CPU/mem (psutil), per-service call mix (last hour), generation success rate, eval latency p50/p95 — each with threshold states. Powers `/ops/health` |
+| GET | `/rag-eval` | RAG-quality dashboard data: configured flag, coverage, avg faithfulness/context-precision (+ status), recent scored `rag_samples`. Powers `/ops/rag-quality` |
+| POST | `/rag-eval/run?n=10` | Score `n` random un-scored `rag_samples` via the Qwen judge (`rag/scorer.py`); 400 if `RAG_SCORER_API_KEY` unset |
 
 **Audited actions** (written to `audit_log` table with `detail` JSONB):
 - `CREATE_ASSESSMENT`, `DEPLOY_ASSESSMENT`, `SUBMIT_ASSESSMENT`
@@ -257,7 +261,10 @@ StaffAssessmentStatus:"not_started" | "in_progress" | "submitted" | "pending_rev
 | `/hr/knowledge` | HR | Indexed sources list (status/chunks/date) + upload + URL indexing |
 | `/hr/users` | HR | **User management** — table with inline edit (role/dept/line manager/start date), activate/deactivate, reset-password (shows temp pw once), add-user form, quick department creator. Nav "Users" tab |
 | `/change-password` | All | Forced (or voluntary) password change; nav-level guard redirects here while `force_password_change` is set |
-| `/ops` | system_admin | **System Processes dashboard** — run list + phased checklist live-tailed over SSE (green=ok, yellow=warn, red=error, blue=running, empty=pending) |
+| `/ops` | system.view | **System Processes dashboard** — run list + phased checklist live-tailed over SSE (green=ok, yellow=warn, red=error, blue=running, empty=pending) |
+| `/ops/health` | system.view | **Platform Health** — resource/pool/CPU/latency tiles (threshold-coloured), service call-mix, embedded system-process logs. Polls `/ops/metrics` every 5s |
+| `/ops/rag-quality` | system.view | **RAG Quality** — RAGAS-style faithfulness + context-precision per KB transaction (Qwen judge), avg tiles, "Score 10 random" action |
+| `/hr/assessments` | HR | All assessments table (name/topic/status/deployed-to/created-by/created) with global search + Status & Created-by filters; reached from the dashboard tiles (`?status=deployed` from the Deployed tile) |
 
 ---
 
@@ -509,6 +516,22 @@ The user manual's "Known limitations & roadmap" maps to the canonical items abov
 
 ## Session Handoff — Next Phases & Open Threads (pick up here)
 
+### Session 2026-06-05 — observability, perf, RAG-quality (DONE; on branches, pushed)
+Backend on `phase2-tests-rbac-kb`, frontend on `phase2-fixes` (PRs proassess-backend#2 / proassess-frontend#1). All committed + pushed.
+
+- **HR dashboard drill-downs.** `GET /admin/assessments` (require_hr) — every org assessment with resolved `deployed_to` ("Entire Organisation" / "Dept (department)" / "Name – Department"), creator, status, created_at. New page **`/hr/assessments`** (searchable, Status + Created-by column filters). HR stat tiles are now **clickable**: Total → `/hr/assessments`, **"Deployed Assessments"** (renamed from "Active (deployed)") → `/hr/assessments?status=deployed`, Staff Assessed → `/hr/assessment-averages`, Knowledge Sources → `/hr/knowledge`. (A `/admin/staff-assessed` endpoint + `/hr/staff-assessed` page were built then removed in favour of the by-department view.)
+
+- **Load-test perf fixes** (from a 23-user concurrency stress test). `database.py` pool raised to **`pool_size=20, max_overflow=40`** (was 10/20 — concurrent submits hit the 30 ceiling → latency cliff). **`MAX_CONCURRENT_GENERATIONS=3`** semaphore in `assessment_service._generate_questions_background` so a burst of "create" actions doesn't degrade KB retrieval/grading. Scenario feedback **parallelized** (`asyncio.gather` over per-question `generate_scenario_feedback`) and moved to a cheaper configurable model **`OPENAI_FEEDBACK_MODEL=gpt-4o-mini`**. Result: 23-user submit p50 12.4s→8.0s, p95 20s→13s; scenario submit ~30-43s→~9-11s.
+  - **⚠️ Lesson (recorded so nobody repeats it):** an attempt to isolate `pipeline_tracker` onto a **NullPool** engine *regressed* latency 4× (a fresh asyncpg connection per tracking write — ~7/submit — cost more than the pool-wait it removed). Reverted: the tracker stays on the **shared pooled** `AsyncSessionLocal`; the bigger main pool is what fixes the exhaustion.
+
+- **Platform Health dashboard.** `GET /ops/metrics` (`system.view`): live DB-pool utilization (`engine.pool`), api CPU/mem (**psutil** — added to requirements), per-service call mix from real `pipeline_spans` (last hour), generation success rate, eval latency p50/p95 — each with threshold states. Page **`/ops/health`** ("Platform Health" nav tab) with threshold-coloured tiles + the system-process logs embedded (latest 50). The `/ops` nav tab is now **exact-match** so it doesn't co-highlight `/ops/*` children.
+  - **System-process logs "overwrite" is a display cap, not data loss:** `/ops/runs` is newest-first, capped (frontend 40, backend default 30, max 200); there's **no auto-purge**. Older runs persist in `pipeline_runs`; query with `?limit=200&kind=` or SQL (`ORDER BY started_at DESC LIMIT n OFFSET m`).
+
+- **RAG-quality scoring (RAGAS-style, Qwen judge).** `rag/scorer.py` scores **faithfulness + context precision** (0–1) via a Qwen model over an **OpenAI-compatible** endpoint (`langchain_openai.ChatOpenAI(base_url=...)`); mirrors `rag.grader` (fails open, span-tracked as service `qwen`). KB/HYBRID generation now **captures `(topic, retrieved contexts, generated Q/A)`** into a new **`rag_samples`** table (`models/system.py` `RagSample`; `_capture_rag_sample` in `rag/__init__.py`, going forward only). `POST /ops/rag-eval/run?n=10` scores random un-scored samples; `GET /ops/rag-eval` feeds the page **`/ops/rag-quality`** ("RAG Quality" nav tab — avg tiles, per-transaction table, "Score 10 random"). Config: **`RAG_SCORER_MODEL`/`RAG_SCORER_BASE_URL`/`RAG_SCORER_API_KEY`** (`.env`).
+  - **⚠️ MuleRouter gotcha:** the live key is **MuleRouter** (`sk-mr-…`), not DashScope. Working base_url is **`https://api.mulerouter.ai/vendors/openai/v1`** (the `/v1` alias 404s — must use `/vendors/openai/v1`); model `qwen-plus`. `config.py` default stays DashScope (generic); the real value is the `.env` override. Verified end-to-end (3 KB samples scored: faithfulness 0.83–1.0, context precision 0.88–0.90 — nicely validating that the grading loop gates out weak-retrieval generations).
+
+- **KB generation has a real grader-breadth limit** (surfaced repeatedly in stress + the 11-assessment batch): KB-grounded **MCQ/Written fail `insufficient_context`** when `num_questions` is high relative to retrieved coverage, *especially on thin docs* — e.g. MCQ-6 succeeds on the 5,297-chunk routing doc but fails on the 190-chunk ITIL / 131-chunk scrum docs; KB **scenario (6Q)** generally passes. AI/context-free formats (personality, coding, AI-MCQ) never fail. **AI Written produces 0 questions** (written needs source context — no viable AI path). Not a bug — the grader honestly refusing weak context — but plan KB MCQ/Written around rich corpora + modest counts.
+
 ### Testing — remaining phases (Phases 1 + 2 DONE; see Known Issues #5)
 - **Phase 2 — API integration ✅ DONE.** `tests/integration/` (41 tests) drives the real app via `httpx.ASGITransport` against a real throwaway `proassess_test` Postgres. Isolation is TRUNCATE-between-tests + committed writes (NOT savepoints — background tasks / `pipeline_tracker` open their own sessions); the app's async engine is disposed per test (loop-bound asyncpg connections). Background generation stubbed; questions inserted directly via `add_questions`. Covers auth/`/auth/me` perms, RBAC 403s, full MCQ lifecycle, scenario review (pending→approve→evaluated), groups CRUD + membership/override perm changes, `generation-status` insufficient_context. See Known Issues #5 for the full harness writeup + run command.
 - **Phase 3 — frontend (pending).** Vitest + React Testing Library for `can()` gating + key components (assessment bar chart, case panel, idle-logout); keep `tsc --noEmit` + `eslint` as the cheap first gate.
@@ -520,8 +543,10 @@ The user manual's "Known limitations & roadmap" maps to the canonical items abov
 
 ### Environment state (demo DB) — fresh sessions should know
 - Stack is running (`docker compose` + `npm run dev`); `proassess.bat stop` shuts it down. `proassess.bat reload` force-recreates the API after `.env` edits.
-- **`staff4@acme.com` is promoted to `system_admin`** (for `/ops`). **`lm.sales@acme.com` has `force_password_change` set** (its password was reset during testing — it can NOT log in with `Password123!`; reset via SQL or the HR UI if you need the second LM).
-- Both repos pushed: `proassess-backend` (main) + `proassess-frontend` (**private**, main) — except the uncommitted backend changes above. Tavily `WEB_SEARCH_API_KEY` is live in `.env` (gitignored).
+- **⚠️ The demo DB was reseeded on 2026-06-04** after an incident: the Phase-2 integration suite (early, broken version) ran against the **real `proassess`** DB instead of `proassess_test` and TRUNCATEd it. Root cause: a stray `/app/__init__.py` made pytest import `config` (caching Settings at the real DB) before the test env-override ran — that file is **now deleted** and the harness **refuses any DB whose name isn't `_test`**. The original custom demo data (KB uploads, assessments, results) had no backup and is gone; `seed.py` restored the documented baseline (Acme org, 8 `@acme.com` users, `Password123!`). **So `staff4@acme.com` is NO LONGER promoted** — the seeded **`sysadmin@acme.com`** is the system_admin, and **`gabriel.ronalds@acme.com`** (HR_ADMIN, manually added to the **Ops** group → has `system.view`) can also reach `/ops`, `/ops/health`, `/ops/rag-quality`.
+- **Demo data now:** 9 users (8 seed + `gabriel.ronalds@acme.com` created via HR UI) and **11 deployed assessments** created 2026-06-05 (3 KB-grounded: OSPF MCQ + 2 scenarios — these feed RAG Quality; 8 AI: 5 MCQ, personality, 2 coding). KB docs indexed: CCNP ENCOR, Lacoste Advanced Routing, scrum, 2× ITIL.
+- **Live `.env` secrets** (gitignored): OpenAI key, Tavily `WEB_SEARCH_API_KEY`, and **`RAG_SCORER_API_KEY`** (MuleRouter, with `RAG_SCORER_BASE_URL=https://api.mulerouter.ai/vendors/openai/v1`).
+- Repos: `proassess-backend` + `proassess-frontend` (**private**). `main` is the earlier Phase-2 baseline; the latest work is on **`phase2-tests-rbac-kb`** (backend) / **`phase2-fixes`** (frontend), pushed, with open PRs #2 / #1 — **not yet merged to main**.
 
 ---
 
