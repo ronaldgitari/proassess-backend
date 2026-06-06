@@ -69,6 +69,72 @@ async def org_stats(
     )
 
 
+@router.get("/assessments")
+async def list_assessments(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_hr),
+):
+    """Every assessment in the org with its resolved 'deployed to' targets and
+    creator — powers the dashboard assessments drill-down page. Newest first."""
+    from models import AssessmentTarget, TargetType
+    org_id = current_user.org_id
+
+    Creator = aliased(User)
+    rows = (await db.execute(
+        select(Assessment, Creator.name)
+        .join(Creator, Assessment.created_by == Creator.id, isouter=True)
+        .where(Assessment.org_id == org_id)
+        .order_by(Assessment.created_at.desc())
+    )).all()
+
+    a_ids = [a.id for a, _ in rows]
+    targets_by_a: dict = {}
+    if a_ids:
+        trows = (await db.execute(
+            select(AssessmentTarget).where(AssessmentTarget.assessment_id.in_(a_ids))
+        )).scalars().all()
+        dept_ids = {t.target_id for t in trows if t.target_type == TargetType.DEPARTMENT}
+        user_ids = {t.target_id for t in trows if t.target_type == TargetType.INDIVIDUALS}
+
+        dept_names = {}
+        if dept_ids:
+            dept_names = {d.id: d.name for d in (await db.execute(
+                select(Department).where(Department.id.in_(dept_ids))
+            )).scalars().all()}
+
+        user_info: dict = {}   # user_id -> (name, department_name)
+        if user_ids:
+            urows = (await db.execute(
+                select(User.id, User.name, Department.name)
+                .outerjoin(UserDepartment, UserDepartment.user_id == User.id)
+                .outerjoin(Department, UserDepartment.department_id == Department.id)
+                .where(User.id.in_(user_ids))
+            )).all()
+            for uid, uname, dname in urows:
+                if uid not in user_info:
+                    user_info[uid] = (uname, dname)
+
+        for t in trows:
+            if t.target_type == TargetType.ORGANISATION:
+                label = "Entire Organisation"
+            elif t.target_type == TargetType.DEPARTMENT:
+                label = f"{dept_names.get(t.target_id, 'Department')} (department)"
+            else:  # INDIVIDUALS
+                uname, dname = user_info.get(t.target_id, ("Unknown", None))
+                label = f"{uname} – {dname}" if dname else uname
+            targets_by_a.setdefault(t.assessment_id, []).append(label)
+
+    return [{
+        "id": str(a.id),
+        "name": a.name,
+        "topic": a.topic,
+        "status": a.status.value,
+        "deployed_to": ", ".join(targets_by_a.get(a.id, [])) or "—",
+        "created_by": creator_name or "—",
+        "created_at": iso_utc(a.created_at),
+    } for a, creator_name in rows]
+
+
 @router.get("/audit-log")
 async def audit_log(
     skip: int = 0,

@@ -19,7 +19,7 @@ from models.knowledge import (
     SourceType, SourceStatus,
 )
 
-from models.system import PipelineRun, PipelineStep, PipelineSpan
+from models.system import PipelineRun, PipelineStep, PipelineSpan, RagSample
 
 __all__ = [
     # User models
@@ -32,5 +32,5 @@ __all__ = [
     # Knowledge models
     "KnowledgeSource", "DocumentChunk", "AuditLog", "SourceType", "SourceStatus",
     # System / observability
-    "PipelineRun", "PipelineStep", "PipelineSpan",
+    "PipelineRun", "PipelineStep", "PipelineSpan", "RagSample",
 ]

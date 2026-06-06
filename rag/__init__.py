@@ -143,6 +143,43 @@ async def _grade_and_refine(
         ctl.warn(f"partial (grade {grade_n}) — re-queried '{refined[:60]}', +{added} chunks (now {len(context_docs)})")
 
 
+def _answer_of(q: dict) -> str:
+    """Best-effort 'correct answer' text from a generated question dict."""
+    ci = q.get("correct_index")
+    opts = q.get("options")
+    if ci is not None and opts:
+        try:
+            return str(opts[ci])
+        except (IndexError, TypeError):
+            pass
+    return str(q.get("model_answer") or "")
+
+
+async def _capture_rag_sample(db, assessment, run_id, topic, context_docs, raw_questions) -> None:
+    """Persist a RAG transaction (query, retrieved contexts, generated items) for later
+    RAGAS-style scoring. KB/HYBRID only; non-fatal. Added to the generation session and
+    committed by the outer db.commit()."""
+    try:
+        from models import RagSample
+        contexts = [getattr(d, "page_content", "")[:1500] for d in (context_docs or [])][:12]
+        items = [{
+            "question": q.get("question", ""),
+            "answer": _answer_of(q),
+            "explanation": (q.get("explanation") or "")[:400],
+        } for q in (raw_questions or [])][:15]
+        if not contexts or not items:
+            return
+        db.add(RagSample(
+            id=uuid.uuid4(), org_id=assessment.org_id, assessment_id=assessment.id,
+            run_id=uuid.UUID(run_id) if run_id else None,
+            question_type=assessment.question_type.value,
+            information_source=assessment.information_source.value,
+            topic=topic, contexts=contexts, items=items,
+        ))
+    except Exception as e:
+        logger.warning("rag-sample capture failed (non-fatal): %s", e)
+
+
 async def generate_questions_for_assessment(assessment, db: AsyncSession) -> list:
     """
     Full RAG pipeline:
@@ -255,6 +292,7 @@ async def generate_questions_for_assessment(assessment, db: AsyncSession) -> lis
 
         # ── Retrieval + augmentation paths ───────────────────────
         raw_questions: list[dict[str, Any]] = []
+        context_docs: list = []   # defined up-front so the RAG-sample capture is always safe
 
         if source == InformationSource.INDUSTRY:
             async with pt.track_step(run_id, "augment") as s:
@@ -350,6 +388,10 @@ async def generate_questions_for_assessment(assessment, db: AsyncSession) -> lis
                                      detail=f"{len(question_objects)} rows"):
                 await db.flush()
             s.note(f"{len(question_objects)} rows written")
+
+        # Capture this transaction for offline RAG-quality scoring (KB/HYBRID only).
+        if source in (InformationSource.KNOWLEDGE_BASE, InformationSource.HYBRID):
+            await _capture_rag_sample(db, assessment, run_id, topic, context_docs, raw_questions)
 
         await pt.finish_run(run_id, "completed")
         logger.info("Pipeline complete: %d questions for assessment %s", len(question_objects), assessment.id)

@@ -9,7 +9,7 @@ from typing import List
 
 from fastapi import APIRouter, Depends, File, Form, UploadFile, HTTPException, BackgroundTasks
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import select, func
 
 from database import get_db
 from models import KnowledgeSource, DocumentChunk, User, SourceType, SourceStatus
@@ -58,15 +58,48 @@ EXTENSION_MAP = {
 }
 
 
+DUPLICATE_NAME_MESSAGE = (
+    "A document with the same name exists. If the document and the indexed source "
+    "are different, rename the document and attempt uploading again."
+)
+
+
+async def _purge_chunks(source: KnowledgeSource, db: AsyncSession) -> None:
+    """Delete a source's chunks from Chroma + the DB (shared by replace & reindex)."""
+    from rag.indexer import get_chroma
+    old = (await db.execute(
+        select(DocumentChunk).where(DocumentChunk.source_id == source.id)
+    )).scalars().all()
+    old_ids = [c.chroma_id for c in old if c.chroma_id]
+    if old_ids:
+        try:
+            get_chroma().delete(ids=old_ids)
+        except Exception:
+            import logging
+            logging.getLogger(__name__).warning(
+                "Chroma chunk delete failed while replacing source %s", source.id
+            )
+    await db.execute(
+        DocumentChunk.__table__.delete().where(DocumentChunk.source_id == source.id)
+    )
+
+
 @router.post("/upload", response_model=KnowledgeSourceOut)
 async def upload_document(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     domain_tag: str = Form(default="general"),
+    replace: bool = Form(default=False),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(require_permission("kb.manage")),
 ):
-    """Upload a PDF, DOCX, or XLSX document and trigger indexing."""
+    """Upload a PDF, DOCX, or XLSX document and trigger indexing.
+
+    Duplicate-name guard: if an ACTIVE indexed source already has the same name,
+    the upload is rejected with 409 unless `replace=true` is sent. Replacing keeps
+    the same source id (so assessments referencing the document still resolve) and
+    re-indexes in place; otherwise the uploader is told to rename the file.
+    """
 
     # Determine source type
     import os
@@ -79,18 +112,44 @@ async def upload_document(
     if len(file_bytes) > 50 * 1024 * 1024:  # 50 MB limit
         raise HTTPException(400, "File exceeds 50 MB limit")
 
-    # Create source record
-    source = KnowledgeSource(
-        id=uuid.uuid4(),
-        org_id=current_user.org_id,
-        name=file.filename,
-        source_type=source_type,
-        domain_tag=domain_tag,
-        status=SourceStatus.PENDING,
-        created_by=current_user.id,
-    )
-    db.add(source)
-    await db.flush()
+    # ── Duplicate-name guard ──────────────────────────────────────
+    # Match against existing ACTIVE sources in the org (case-insensitive on name).
+    existing = (await db.execute(
+        select(KnowledgeSource).where(
+            KnowledgeSource.org_id == current_user.org_id,
+            KnowledgeSource.is_active == True,  # noqa: E712
+            func.lower(KnowledgeSource.name) == (file.filename or "").lower(),
+        )
+    )).scalar_one_or_none()
+
+    if existing and not replace:
+        # No alternative is offered unless the uploader explicitly opts to replace.
+        raise HTTPException(status_code=409, detail=DUPLICATE_NAME_MESSAGE)
+
+    if existing and replace:
+        # Replace in place: purge old chunks, reset the SAME record, re-index.
+        await _purge_chunks(existing, db)
+        existing.source_type = source_type
+        existing.domain_tag = domain_tag
+        existing.status = SourceStatus.PENDING
+        existing.chunk_count = 0
+        existing.index_error = None
+        existing.is_active = True
+        db.add(existing)
+        await db.flush()
+        source = existing
+    else:
+        source = KnowledgeSource(
+            id=uuid.uuid4(),
+            org_id=current_user.org_id,
+            name=file.filename,
+            source_type=source_type,
+            domain_tag=domain_tag,
+            status=SourceStatus.PENDING,
+            created_by=current_user.id,
+        )
+        db.add(source)
+        await db.flush()
 
     # TODO: upload to S3/MinIO
     # s3_key = f"{current_user.org_id}/{source.id}/{file.filename}"

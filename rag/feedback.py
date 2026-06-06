@@ -109,7 +109,9 @@ async def generate_scenario_feedback(
     )
 
     llm = ChatOpenAI(
-        model=settings.OPENAI_CHAT_MODEL,
+        # Draft feedback is human-reviewed by an LM before release, so the cheaper
+        # model is sufficient and far less costly at scale (configurable).
+        model=settings.OPENAI_FEEDBACK_MODEL,
         temperature=0.2,
         max_tokens=settings.OPENAI_MAX_TOKENS,
         openai_api_key=settings.OPENAI_API_KEY,

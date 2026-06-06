@@ -8,6 +8,30 @@ sets the pattern for the Phase 2 integration tests.
 import os
 import sys
 
+# ─────────────────────────────────────────────────────────────────
+# Test database wiring (MUST run before `config`/`database` are imported)
+# ─────────────────────────────────────────────────────────────────
+# Phase 2 integration tests talk to a REAL but DISPOSABLE Postgres database
+# (JSONB / native enums mean SQLite won't do). We point the whole app at a
+# dedicated `proassess_test` database so the demo data is never touched.
+#
+# This MUST happen at import time of the root conftest — before anything imports
+# `config` (which builds a cached Settings singleton) or `database` (which builds
+# the async engine from that singleton). The container ships a real DATABASE_URL
+# as an OS env var, so we *force* (not setdefault) the test value over it.
+#
+# Setting these env vars is harmless for the pure-logic unit tests: they never
+# open a connection. Override the target with TEST_DATABASE_URL if needed.
+_TEST_DB_URL = os.environ.get(
+    "TEST_DATABASE_URL",
+    "postgresql+asyncpg://proassess:proassess@postgres:5432/proassess_test",
+)
+os.environ["DATABASE_URL"] = _TEST_DB_URL
+os.environ["DATABASE_URL_SYNC"] = _TEST_DB_URL.replace("+asyncpg", "")
+os.environ["APP_ENV"] = "test"          # quietens SQL echo; not "development"/"production"
+# Ensure JWT signing works even if the container didn't pass a SECRET_KEY through.
+os.environ.setdefault("SECRET_KEY", "integration-test-secret-key")
+
 # Make the project root (the dir containing rag/, services/, models/, schemas/) importable
 # regardless of where pytest is invoked from.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))

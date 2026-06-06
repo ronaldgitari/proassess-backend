@@ -61,6 +61,11 @@ async def capture_server_meta(run_id: str | None) -> None:
 
 @asynccontextmanager
 async def _session():
+    # Use the shared pooled sessionmaker: connections are REUSED (cheap), and the
+    # enlarged request pool (database.py) gives enough headroom that tracking writes
+    # don't starve `get_db`. An earlier attempt to isolate tracking on a NullPool
+    # engine backfired — opening a fresh connection per write added more latency
+    # under load than the pool-wait it removed.
     from database import AsyncSessionLocal
     async with AsyncSessionLocal() as db:
         yield db
