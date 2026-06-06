@@ -106,27 +106,45 @@ async def create_assessment(
     return assessment
 
 
+# Limit how many assessments generate concurrently (per worker). Without this, a
+# burst of "create" actions all hit embeddings/retrieval at once → retrieval thins
+# out → the grader honestly aborts (insufficient_context), as the stress test showed.
+# Lazily created so the limit binds to the running event loop.
+import asyncio as _asyncio
+_GEN_SEMAPHORE: "_asyncio.Semaphore | None" = None
+
+
+def _gen_semaphore() -> "_asyncio.Semaphore":
+    global _GEN_SEMAPHORE
+    if _GEN_SEMAPHORE is None:
+        from config import settings
+        _GEN_SEMAPHORE = _asyncio.Semaphore(max(1, settings.MAX_CONCURRENT_GENERATIONS))
+    return _GEN_SEMAPHORE
+
+
 async def _generate_questions_background(assessment_id: str, origin_ip: str | None = None):
     """Background task: run the RAG pipeline and populate questions."""
     from database import AsyncSessionLocal
     from services import pipeline_tracker as pt
     pt.set_origin_ip(origin_ip)   # so capture_server_meta records the real origin
-    async with AsyncSessionLocal() as db:
-        result = await db.execute(
-            select(Assessment).where(Assessment.id == uuid.UUID(assessment_id))
-        )
-        assessment = result.scalar_one_or_none()
-        if not assessment:
-            return
-        try:
-            await generate_questions_for_assessment(assessment, db)
-            await db.commit()
-        except Exception as e:
-            import logging, traceback
-            logging.getLogger(__name__).error(
-                "Question generation failed for %s: %s\n%s",
-                assessment_id, e, traceback.format_exc(),
+    # Throttle concurrent generations so retrieval/grading stays healthy under bursts.
+    async with _gen_semaphore():
+        async with AsyncSessionLocal() as db:
+            result = await db.execute(
+                select(Assessment).where(Assessment.id == uuid.UUID(assessment_id))
             )
+            assessment = result.scalar_one_or_none()
+            if not assessment:
+                return
+            try:
+                await generate_questions_for_assessment(assessment, db)
+                await db.commit()
+            except Exception as e:
+                import logging, traceback
+                logging.getLogger(__name__).error(
+                    "Question generation failed for %s: %s\n%s",
+                    assessment_id, e, traceback.format_exc(),
+                )
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -358,8 +376,12 @@ async def submit_assessment(
             )).scalars().all()
             saved_map = {str(a.question_id): a for a in saved}
 
-            scores: list[float] = []
-            for q in questions:
+            # Draft feedback per question runs CONCURRENTLY (each is an independent
+            # web search + GPT call) — collapses a ~6×-serial wait into one round.
+            # The run contextvar propagates into the gathered tasks, so spans still
+            # attribute correctly; generate_scenario_feedback doesn't touch `db`, so
+            # the ORM session isn't used concurrently — results are applied after.
+            async def _draft(q):
                 child = saved_map.get(str(q.id))
                 fb = await generate_scenario_feedback(
                     topic=assessment.topic,
@@ -369,6 +391,11 @@ async def submit_assessment(
                     staff_response=child.answer_text if child else None,
                     case_text=case_text,
                 )
+                return child, fb
+
+            drafted = await _asyncio.gather(*[_draft(q) for q in questions])
+            scores: list[float] = []
+            for child, fb in drafted:
                 if child:
                     child.score = fb["score"]
                     child.ai_feedback = fb["feedback"]

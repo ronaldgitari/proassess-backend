@@ -26,6 +26,14 @@ class Settings(BaseSettings):
     OPENAI_API_KEY: str = ""
     OPENAI_CHAT_MODEL: str = "gpt-4o"
     OPENAI_GRADER_MODEL: str = "gpt-4o-mini"   # cheap, deterministic context grading (reflection loop)
+    OPENAI_FEEDBACK_MODEL: str = "gpt-4o-mini"  # scenario/case-study draft feedback (an LM reviews it, so mini is enough)
+
+    # RAG-quality scorer (RAGAS-style faithfulness + context precision). Uses a Qwen
+    # model via any OpenAI-compatible endpoint (Alibaba DashScope, OpenRouter, Together,
+    # local vLLM/Ollama). Put the key in .env as RAG_SCORER_API_KEY (see base_url below).
+    RAG_SCORER_MODEL: str = "qwen-plus"
+    RAG_SCORER_BASE_URL: str = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
+    RAG_SCORER_API_KEY: str = ""
     OPENAI_EMBEDDING_MODEL: str = "text-embedding-3-large"
     OPENAI_EMBEDDING_DIMENSIONS: int = 3072
     OPENAI_MAX_TOKENS: int = 8192
@@ -43,6 +51,10 @@ class Settings(BaseSettings):
     TOP_K_FINAL: int = 10
     RERANKER_MODEL: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
     MAX_REGRADE: int = 2   # hard cap on grade→re-query reflection loops (bounded latency/cost)
+    # Cap on assessments generating at once (per worker). A burst of concurrent
+    # "create" actions otherwise contends on embeddings/retrieval, thinning the
+    # context the grader sees → spurious insufficient_context failures.
+    MAX_CONCURRENT_GENERATIONS: int = 3
 
     # Web research for rich scenario feedback (case-study assessments).
     # Provider plug-in for credible external sources cited in AI feedback.
