@@ -262,6 +262,232 @@ async def get_capsule(
     }
 
 
+# ─────────────────────────────────────────────────────────────────
+# Platform health metrics (Platform Health dashboard)
+# ─────────────────────────────────────────────────────────────────
+
+# Threshold rules surfaced on the dashboard (also used to colour each panel).
+THRESHOLDS = {
+    "pool_util_warn": 70.0, "pool_util_crit": 90.0,        # % of max DB connections in use
+    "eval_p95_warn_ms": 2000.0, "eval_p95_crit_ms": 8000.0, # submit/eval latency p95
+    "gen_fail_warn_pct": 20.0, "gen_fail_crit_pct": 50.0,   # generation failure rate
+    "cpu_warn": 85.0, "cpu_crit": 100.0,                    # api CPU %
+}
+
+
+def _state(value, warn, crit):
+    if value is None:
+        return "unknown"
+    return "crit" if value >= crit else ("warn" if value >= warn else "ok")
+
+
+def _pctl(sorted_vals, q):
+    if not sorted_vals:
+        return None
+    i = min(len(sorted_vals) - 1, int(len(sorted_vals) * q))
+    return round(sorted_vals[i], 1)
+
+
+@router.get("/metrics")
+async def platform_metrics(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_permission("system.view")),
+):
+    """Live platform-health snapshot for the dashboard: DB pool, process CPU/mem,
+    per-service call mix (from real spans), generation success rate, eval latency,
+    and threshold evaluation. Cheap + read-mostly; safe to poll every few seconds."""
+    from datetime import datetime, timedelta
+    now = datetime.utcnow()
+    since_1h = now - timedelta(hours=1)
+    since_24h = now - timedelta(hours=24)
+
+    # ── DB connection pool (the stress-test bottleneck) ───────────
+    pool_block = {"available": False}
+    try:
+        from database import engine
+        pool = engine.pool
+        checked_out = pool.checkedout()
+        size = pool.size()
+        max_overflow = getattr(pool, "_max_overflow", 0)
+        max_cap = size + max(max_overflow, 0)
+        util = round(100.0 * checked_out / max_cap, 1) if max_cap else 0.0
+        pool_block = {
+            "available": True, "checked_out": checked_out, "pool_size": size,
+            "max_connections": max_cap, "utilization_pct": util,
+            "status": _state(util, THRESHOLDS["pool_util_warn"], THRESHOLDS["pool_util_crit"]),
+        }
+    except Exception as e:
+        pool_block["error"] = str(e)[:120]
+
+    # ── API process CPU / memory (psutil; optional) ───────────────
+    proc_block = {"available": False}
+    try:
+        import psutil
+        proc_block = {
+            "available": True,
+            "cpu_pct": round(psutil.cpu_percent(interval=0.15), 1),
+            "mem_mb": round(psutil.Process().memory_info().rss / (1024 * 1024), 1),
+            "status": _state(psutil.cpu_percent(interval=0.0), THRESHOLDS["cpu_warn"], THRESHOLDS["cpu_crit"]),
+        }
+    except Exception as e:
+        proc_block["error"] = str(e)[:120]
+
+    # ── Per-service call mix from real spans (last hour) ──────────
+    from models import PipelineSpan, PipelineRun
+    span_rows = (await db.execute(
+        select(
+            PipelineSpan.service,
+            func.count().label("calls"),
+            func.avg(PipelineSpan.duration_ms).label("avg_ms"),
+            func.sum(PipelineSpan.duration_ms).label("total_ms"),
+        )
+        .where(PipelineSpan.started_at >= since_1h)
+        .group_by(PipelineSpan.service)
+        .order_by(func.count().desc())
+    )).all()
+    services = [{
+        "service": s, "calls": c,
+        "avg_ms": round(float(a or 0), 1), "total_ms": round(float(t or 0), 1),
+    } for s, c, a, t in span_rows]
+
+    # ── Generation success rate (last 24h) ────────────────────────
+    gen_rows = dict((st, c) for st, c in (await db.execute(
+        select(PipelineRun.status, func.count())
+        .where(PipelineRun.kind == "generation", PipelineRun.started_at >= since_24h)
+        .group_by(PipelineRun.status)
+    )).all())
+    gen_completed = gen_rows.get("completed", 0)
+    gen_failed = gen_rows.get("failed", 0)
+    gen_running = gen_rows.get("running", 0)
+    gen_total = gen_completed + gen_failed
+    gen_fail_pct = round(100.0 * gen_failed / gen_total, 1) if gen_total else 0.0
+    generation = {
+        "completed": gen_completed, "failed": gen_failed, "running": gen_running,
+        "fail_pct": gen_fail_pct,
+        "status": _state(gen_fail_pct, THRESHOLDS["gen_fail_warn_pct"], THRESHOLDS["gen_fail_crit_pct"]),
+    }
+
+    # ── Evaluation (submit) latency p50/p95 from real runs (last hour) ──
+    durs = sorted(float(d) * 1000 for (d,) in (await db.execute(
+        select(func.extract("epoch", PipelineRun.finished_at - PipelineRun.started_at))
+        .where(
+            PipelineRun.kind == "evaluation",
+            PipelineRun.finished_at.isnot(None),
+            PipelineRun.started_at >= since_1h,
+        )
+    )).all() if d is not None)
+    p95 = _pctl(durs, 0.95)
+    eval_latency = {
+        "count": len(durs), "p50_ms": _pctl(durs, 0.50), "p95_ms": p95,
+        "status": _state(p95, THRESHOLDS["eval_p95_warn_ms"], THRESHOLDS["eval_p95_crit_ms"]),
+    }
+
+    return {
+        "generated_at": iso_utc(now),
+        "pool": pool_block,
+        "process": proc_block,
+        "services": services,
+        "generation": generation,
+        "eval_latency": eval_latency,
+        "thresholds": THRESHOLDS,
+    }
+
+
+# ─────────────────────────────────────────────────────────────────
+# RAG quality scoring (RAGAS-style; Qwen judge) — for the RAG Quality dashboard
+# ─────────────────────────────────────────────────────────────────
+
+RAG_THRESHOLDS = {
+    "faithfulness_warn": 0.80, "faithfulness_crit": 0.60,
+    "context_precision_warn": 0.70, "context_precision_crit": 0.50,
+}
+
+
+def _state_low(v, warn, crit):
+    """Higher is better: crit below `crit`, warn below `warn`, else ok."""
+    if v is None:
+        return "unknown"
+    return "crit" if v < crit else ("warn" if v < warn else "ok")
+
+
+@router.post("/rag-eval/run")
+async def rag_eval_run(
+    n: int = Query(10, ge=1, le=50),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_permission("system.view")),
+):
+    """Sample `n` random un-scored RAG transactions and score them (faithfulness +
+    context precision) with the Qwen judge. Stores the scores; returns a summary."""
+    from datetime import datetime
+    from models import RagSample
+    from rag.scorer import score_sample, is_configured
+    from config import settings
+
+    if not is_configured():
+        raise HTTPException(400, "RAG scorer not configured — set RAG_SCORER_API_KEY in .env (then force-recreate the api container).")
+
+    rows = (await db.execute(
+        select(RagSample)
+        .where(RagSample.scored_at.is_(None), RagSample.contexts.isnot(None))
+        .order_by(func.random())
+        .limit(n)
+    )).scalars().all()
+
+    scored, results = 0, []
+    for s in rows:
+        res = await score_sample(s.topic or "", s.contexts or [], s.items or [])
+        if res.get("faithfulness") is not None or res.get("context_precision") is not None:
+            s.faithfulness = res.get("faithfulness")
+            s.context_precision = res.get("context_precision")
+            s.rationale = res.get("rationale")
+            s.scored_at = datetime.utcnow()
+            db.add(s)
+            scored += 1
+            results.append({"id": str(s.id), "topic": s.topic,
+                            "faithfulness": s.faithfulness, "context_precision": s.context_precision})
+    await db.flush()
+    return {"model": settings.RAG_SCORER_MODEL, "sampled": len(rows), "scored": scored, "results": results}
+
+
+@router.get("/rag-eval")
+async def rag_eval_summary(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_permission("system.view")),
+):
+    """RAG-quality dashboard data: configured flag, coverage, average scores (with
+    threshold states), and the most recently scored transactions."""
+    from models import RagSample
+    from rag.scorer import is_configured
+    from config import settings
+
+    total = await db.scalar(select(func.count()).select_from(RagSample))
+    scored = await db.scalar(select(func.count()).select_from(RagSample).where(RagSample.scored_at.isnot(None)))
+    avg_f = await db.scalar(select(func.avg(RagSample.faithfulness)).where(RagSample.faithfulness.isnot(None)))
+    avg_cp = await db.scalar(select(func.avg(RagSample.context_precision)).where(RagSample.context_precision.isnot(None)))
+    recent = (await db.execute(
+        select(RagSample).where(RagSample.scored_at.isnot(None))
+        .order_by(RagSample.scored_at.desc()).limit(20)
+    )).scalars().all()
+
+    avg_f = round(float(avg_f), 3) if avg_f is not None else None
+    avg_cp = round(float(avg_cp), 3) if avg_cp is not None else None
+    return {
+        "configured": is_configured(),
+        "model": settings.RAG_SCORER_MODEL,
+        "total": total or 0, "scored": scored or 0, "unscored": (total or 0) - (scored or 0),
+        "avg_faithfulness": avg_f, "avg_context_precision": avg_cp,
+        "faithfulness_status": _state_low(avg_f, RAG_THRESHOLDS["faithfulness_warn"], RAG_THRESHOLDS["faithfulness_crit"]),
+        "context_precision_status": _state_low(avg_cp, RAG_THRESHOLDS["context_precision_warn"], RAG_THRESHOLDS["context_precision_crit"]),
+        "thresholds": RAG_THRESHOLDS,
+        "samples": [{
+            "id": str(s.id), "topic": s.topic, "question_type": s.question_type,
+            "information_source": s.information_source,
+            "faithfulness": s.faithfulness, "context_precision": s.context_precision,
+            "rationale": s.rationale, "scored_at": iso_utc(s.scored_at),
+        } for s in recent],
+    }
+
+
 @router.get("/runs/{run_id}/stream")
 async def stream_run(
     run_id: uuid.UUID,

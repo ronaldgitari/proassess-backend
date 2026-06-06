@@ -13,7 +13,7 @@ Status values are plain strings (no native enum) to avoid migrations:
 import uuid
 from datetime import datetime
 from sqlalchemy import Column, String, DateTime, ForeignKey, Integer, Text, Float
-from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.orm import relationship
 from database import Base
 
@@ -72,6 +72,32 @@ class PipelineSpan(Base):
     finished_at = Column(DateTime, nullable=True)
 
     run = relationship("PipelineRun", back_populates="spans")
+
+
+class RagSample(Base):
+    """
+    A captured RAG generation transaction for offline quality scoring (RAGAS-style).
+    Stores the query, the retrieved context chunks, and the generated items so a Qwen
+    judge can later score faithfulness + context precision. Populated for KB/HYBRID
+    generations; scored on demand by /ops/rag-eval/run.
+    """
+    __tablename__ = "rag_samples"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    org_id = Column(UUID(as_uuid=True), nullable=True)
+    assessment_id = Column(UUID(as_uuid=True), nullable=True)
+    run_id = Column(UUID(as_uuid=True), nullable=True)        # owning generation PipelineRun
+    question_type = Column(String(40), nullable=True)
+    information_source = Column(String(40), nullable=True)    # kb | hybrid
+    topic = Column(Text, nullable=True)                       # the query/topic
+    contexts = Column(JSONB, nullable=True)                   # list[str] retrieved chunk texts
+    items = Column(JSONB, nullable=True)                      # list[{question, answer, explanation}]
+    # RAGAS-style scores (0..1), filled in when scored
+    faithfulness = Column(Float, nullable=True)
+    context_precision = Column(Float, nullable=True)
+    rationale = Column(Text, nullable=True)
+    scored_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
 
 
 class PipelineStep(Base):
