@@ -39,6 +39,7 @@ class User(Base):
     # Per-individual permission overrides on top of role/group permissions.
     extra_permissions = Column(JSONB, nullable=True)    # granted in addition to groups
     denied_permissions = Column(JSONB, nullable=True)   # revoked even if a group grants them
+    settings = Column(JSONB, nullable=True)             # per-user setting overrides (e.g. idle_timeout_minutes)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -55,6 +56,7 @@ class Organisation(Base):
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     name = Column(String(255), nullable=False)
     slug = Column(String(100), unique=True, nullable=False)
+    settings = Column(JSONB, nullable=True)             # org-wide platform setting overrides
     created_at = Column(DateTime, default=datetime.utcnow)
 
     users = relationship("User", back_populates="org")

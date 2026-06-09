@@ -243,34 +243,81 @@ async def share_assessment(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(require_lm),
 ):
-    """Add new department/individual targets to a deployed assessment."""
+    """Add new department/individual targets to a deployed assessment.
+
+    Returns {shared, duplicates: [{id, name}], skipped}.
+    • 409 when every requested target is already assigned.
+    • 200 (partial) when some are new and some are duplicates.
+    """
     from services.assessment_service import _get_assessment_owned
-    from models import AssessmentTarget, AuditLog
+    from models import AssessmentTarget, AuditLog, Department, TargetType
 
     assessment = await _get_assessment_owned(assessment_id, current_user, db)
     if assessment.status not in (AssessmentStatus.DEPLOYED, AssessmentStatus.ACTIVE):
         raise HTTPException(400, "Only deployed assessments can be shared")
 
     excluded = await _existing_target_ids(assessment_id, db)
-    added = 0
+
+    # Separate incoming target_ids into new vs. already-assigned
+    dup_ids: list[UUID] = []
+    new_ids: list[UUID] = []
     for tid in req.target_ids:
-        if str(tid) in excluded:
-            continue
+        (dup_ids if str(tid) in excluded else new_ids).append(tid)
+
+    # Resolve human-readable names for duplicates so the caller knows exactly
+    # who is already assigned without a separate round-trip.
+    dup_names: dict[str, str] = {}
+    if dup_ids:
+        if req.target_type == TargetType.DEPARTMENT:
+            rows = (await db.execute(
+                select(Department.id, Department.name).where(Department.id.in_(dup_ids))
+            )).all()
+            dup_names = {str(r.id): r.name for r in rows}
+        else:  # INDIVIDUALS
+            rows = (await db.execute(
+                select(User.id, User.name).where(User.id.in_(dup_ids))
+            )).all()
+            dup_names = {str(r.id): r.name for r in rows}
+
+    duplicates = [
+        {"id": str(did), "name": dup_names.get(str(did), str(did))}
+        for did in dup_ids
+    ]
+
+    # All selected targets are already assigned → hard reject with 409
+    if dup_ids and not new_ids:
+        noun = "department" if req.target_type == TargetType.DEPARTMENT else "recipient"
+        names_str = ", ".join(d["name"] for d in duplicates[:5])
+        suffix = f" and {len(duplicates) - 5} more" if len(duplicates) > 5 else ""
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": (
+                    f"All selected {noun}s already have access to this assessment: "
+                    f"{names_str}{suffix}."
+                ),
+                "duplicates": duplicates,
+            },
+        )
+
+    # Add the genuinely new targets
+    for tid in new_ids:
         db.add(AssessmentTarget(
             assessment_id=assessment_id,
             target_type=req.target_type,
             target_id=tid,
         ))
-        added += 1
 
+    added = len(new_ids)
     db.add(AuditLog(
         user_id=current_user.id,
         action="SHARE_ASSESSMENT",
         resource_type="assessment",
         resource_id=assessment_id,
-        detail={"target_type": req.target_type.value, "count": added},
+        detail={"target_type": req.target_type.value, "count": added, "skipped_duplicates": len(dup_ids)},
     ))
-    return {"shared": added}
+    await db.commit()
+    return {"shared": added, "duplicates": duplicates, "skipped": len(dup_ids)}
 
 
 # ── Staff: recent results ────────────────────────────────────────

@@ -121,11 +121,12 @@ async def generate_scenario_feedback(
     from services import pipeline_tracker as pt
     try:
         async with pt.track_span("openai", "chat.completion · scenario feedback",
-                                 phase="feedback", detail=question_text[:60]):
+                                 phase="feedback", detail=question_text[:60]) as span:
             resp = await llm.ainvoke([
                 {"role": "system", "content": FEEDBACK_SYSTEM_PROMPT},
                 {"role": "user", "content": user},
             ])
+            span.capture(resp)
         obj = extract_json_object(resp.content)
         score = max(0.0, min(100.0, float(obj.get("score", 0))))
         feedback = str(obj.get("feedback", "")).strip() or "Feedback unavailable."

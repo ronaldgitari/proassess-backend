@@ -17,9 +17,28 @@ from datetime import datetime
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
 
+from dataclasses import dataclass, field
 from sqlalchemy import select, update
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class _SpanCtx:
+    """Yielded by track_span so callers can attach token counts before the span is written."""
+    span_id: str | None
+    _prompt_tokens: int | None = field(default=None, repr=False)
+    _completion_tokens: int | None = field(default=None, repr=False)
+
+    def capture(self, response) -> None:
+        """Read token usage from a LangChain AIMessage and store it for the span write."""
+        try:
+            um = getattr(response, "usage_metadata", None) or {}
+            p = int(um.get("input_tokens") or um.get("prompt_tokens") or 0) or None
+            c = int(um.get("output_tokens") or um.get("completion_tokens") or 0) or None
+            self._prompt_tokens, self._completion_tokens = p, c
+        except Exception:
+            pass
 
 # Current run id for the active transaction. A ContextVar propagates across
 # `await` boundaries and into asyncio.gather() tasks automatically, so deep
@@ -207,10 +226,11 @@ async def set_run_meta(run_id: str | None, *, origin_ip=None, server_ip=None, sy
 
 
 async def record_span(
-    *, service: str, operation: str, status: str, duration_ms: float,
+    *, span_id=None, service: str, operation: str, status: str, duration_ms: float,
     detail: str | None = None, phase: str | None = None,
     started_at: datetime | None = None, finished_at: datetime | None = None,
     run_id: str | None = None,
+    prompt_tokens: int | None = None, completion_tokens: int | None = None,
 ) -> None:
     """Persist one finished span. Uses the contextvar run if run_id not given."""
     run_id = run_id or get_current_run()
@@ -220,11 +240,12 @@ async def record_span(
     try:
         async with _session() as db:
             db.add(PipelineSpan(
-                id=uuid.uuid4(), run_id=uuid.UUID(run_id),
+                id=span_id or uuid.uuid4(), run_id=uuid.UUID(run_id),
                 service=service, operation=operation, phase=phase,
                 status=status, detail=(detail[:500] if detail else None),
                 duration_ms=round(duration_ms, 1),
                 started_at=started_at, finished_at=finished_at,
+                prompt_tokens=prompt_tokens, completion_tokens=completion_tokens,
             ))
             await db.commit()
     except Exception as e:
@@ -237,24 +258,27 @@ async def track_span(service: str, operation: str, *, phase: str | None = None, 
     Wrap a real backing-service call to record a span with true timing.
     Reads the active run from the contextvar — no run_id plumbing needed.
 
-        async with track_span("openai", "chat.completion", phase="augment"):
-            await llm.ainvoke(...)
+        async with track_span("openai", "chat.completion", phase="augment") as span:
+            response = await llm.ainvoke(...)
+            span.capture(response)   # attaches token counts to the span
 
     Non-fatal: span-recording errors never propagate; the wrapped call's own
     exceptions DO propagate (after recording an error span).
     """
     if get_current_run() is None:
-        # Not inside a tracked run — no-op passthrough
-        yield
+        # Not inside a tracked run — no-op passthrough; _SpanCtx(None) is safe to call .capture() on
+        yield _SpanCtx(None)
         return
 
+    sid = uuid.uuid4()
+    ctx = _SpanCtx(str(sid))
     start = time.perf_counter()
     started_at = datetime.utcnow()
     try:
-        yield
+        yield ctx
     except Exception as e:
         await record_span(
-            service=service, operation=operation, status="error",
+            span_id=sid, service=service, operation=operation, status="error",
             duration_ms=(time.perf_counter() - start) * 1000,
             detail=str(e)[:500], phase=phase,
             started_at=started_at, finished_at=datetime.utcnow(),
@@ -262,8 +286,9 @@ async def track_span(service: str, operation: str, *, phase: str | None = None, 
         raise
     else:
         await record_span(
-            service=service, operation=operation, status="ok",
+            span_id=sid, service=service, operation=operation, status="ok",
             duration_ms=(time.perf_counter() - start) * 1000,
             detail=detail, phase=phase,
             started_at=started_at, finished_at=datetime.utcnow(),
+            prompt_tokens=ctx._prompt_tokens, completion_tokens=ctx._completion_tokens,
         )

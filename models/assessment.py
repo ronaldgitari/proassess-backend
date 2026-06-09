@@ -170,6 +170,15 @@ class StaffAnswer(Base):
     # [{ "title", "url", "snippet", "kind": "kb"|"web" }, ...]
     feedback_sources = Column(JSONB, nullable=True)
     answered_at = Column(DateTime, default=datetime.utcnow)
+    # Self-correcting evaluation fields (Maker → Checker → Router loop)
+    # Existing DBs need:
+    #   ALTER TABLE staff_answers
+    #     ADD COLUMN IF NOT EXISTS eval_attempts integer,
+    #     ADD COLUMN IF NOT EXISTS eval_flagged boolean NOT NULL DEFAULT false,
+    #     ADD COLUMN IF NOT EXISTS eval_scratchpad jsonb;
+    eval_attempts = Column(Integer, nullable=True)           # Maker passes needed (1 = clean first pass)
+    eval_flagged = Column(Boolean, nullable=False, default=False, server_default="false")  # circuit breaker fired
+    eval_scratchpad = Column(JSONB, nullable=True)           # list[str] Checker critiques from failed rounds
 
     staff_assessment = relationship("StaffAssessment", back_populates="answers")
     question = relationship("Question", back_populates="answers")

@@ -51,7 +51,8 @@ class UserOut(_UTCDatetimeMixin):
     org_id: UUID
     is_active: bool
     force_password_change: bool = False
-    permissions: List[str] = []          # effective capability keys (role ∪ groups ± overrides)
+    permissions: List[str] = []                          # effective capability keys (role ∪ groups ± overrides)
+    effective_settings: Optional[Dict[str, Any]] = None  # computed platform settings for this user
     created_at: datetime
     model_config = {"from_attributes": True}
 

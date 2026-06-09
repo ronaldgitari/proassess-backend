@@ -70,6 +70,8 @@ class PipelineSpan(Base):
     duration_ms = Column(Float, nullable=True)
     started_at = Column(DateTime, nullable=True)
     finished_at = Column(DateTime, nullable=True)
+    prompt_tokens = Column(Integer, nullable=True)
+    completion_tokens = Column(Integer, nullable=True)
 
     run = relationship("PipelineRun", back_populates="spans")
 

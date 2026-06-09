@@ -288,8 +288,9 @@ async def _call_gpt(system: str, user: str, temperature: float | None = None) ->
         {"role": "system", "content": system},
         {"role": "user", "content": user},
     ]
-    async with pt.track_span("openai", f"chat.completion · {settings.OPENAI_CHAT_MODEL}", detail="question generation"):
+    async with pt.track_span("openai", f"chat.completion · {settings.OPENAI_CHAT_MODEL}", detail="question generation") as span:
         response = await llm.ainvoke(messages)
+        span.capture(response)
     return response.content
 
 

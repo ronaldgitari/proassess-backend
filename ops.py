@@ -22,9 +22,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
 
 from database import get_db, AsyncSessionLocal
-from models import PipelineRun, PipelineStep, PipelineSpan, User, Assessment, KnowledgeSource, StaffAssessment
+from models import PipelineRun, PipelineStep, PipelineSpan, User, Assessment, KnowledgeSource, StaffAssessment, StaffAnswer
 from services.auth_service import require_permission, has_permission, get_user_from_token
 from timeutil import iso_utc
+
+import logging
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/ops", tags=["ops"])
 
@@ -219,6 +222,8 @@ async def get_capsule(
             "duration_ms": sp.duration_ms,
             "started_at": iso_utc(sp.started_at),
             "finished_at": iso_utc(sp.finished_at),
+            "prompt_tokens": sp.prompt_tokens,
+            "completion_tokens": sp.completion_tokens,
         })
 
     services_block = [{
@@ -272,6 +277,7 @@ THRESHOLDS = {
     "eval_p95_warn_ms": 2000.0, "eval_p95_crit_ms": 8000.0, # submit/eval latency p95
     "gen_fail_warn_pct": 20.0, "gen_fail_crit_pct": 50.0,   # generation failure rate
     "cpu_warn": 85.0, "cpu_crit": 100.0,                    # api CPU %
+    "mem_warn_mb": 512.0, "mem_crit_mb": 1024.0,            # api process RSS
 }
 
 
@@ -323,11 +329,14 @@ async def platform_metrics(
     proc_block = {"available": False}
     try:
         import psutil
+        cpu_pct = round(psutil.cpu_percent(interval=0.15), 1)
+        mem_mb = round(psutil.Process().memory_info().rss / (1024 * 1024), 1)
         proc_block = {
             "available": True,
-            "cpu_pct": round(psutil.cpu_percent(interval=0.15), 1),
-            "mem_mb": round(psutil.Process().memory_info().rss / (1024 * 1024), 1),
-            "status": _state(psutil.cpu_percent(interval=0.0), THRESHOLDS["cpu_warn"], THRESHOLDS["cpu_crit"]),
+            "cpu_pct": cpu_pct,
+            "mem_mb": mem_mb,
+            "status": _state(cpu_pct, THRESHOLDS["cpu_warn"], THRESHOLDS["cpu_crit"]),
+            "mem_status": _state(mem_mb, THRESHOLDS["mem_warn_mb"], THRESHOLDS["mem_crit_mb"]),
         }
     except Exception as e:
         proc_block["error"] = str(e)[:120]
@@ -382,6 +391,16 @@ async def platform_metrics(
         "status": _state(p95, THRESHOLDS["eval_p95_warn_ms"], THRESHOLDS["eval_p95_crit_ms"]),
     }
 
+    # ── Flagged evaluations (circuit-breaker fires) ───────────────
+    flagged_evals = 0
+    try:
+        flagged_evals = await db.scalar(
+            select(func.count()).select_from(StaffAnswer)
+            .where(StaffAnswer.eval_flagged == True)  # noqa: E712
+        ) or 0
+    except Exception as e:
+        logger.warning("ops.platform_metrics flagged_evals query failed: %s", e)
+
     return {
         "generated_at": iso_utc(now),
         "pool": pool_block,
@@ -389,6 +408,7 @@ async def platform_metrics(
         "services": services,
         "generation": generation,
         "eval_latency": eval_latency,
+        "flagged_evals": flagged_evals,
         "thresholds": THRESHOLDS,
     }
 
@@ -400,6 +420,10 @@ async def platform_metrics(
 RAG_THRESHOLDS = {
     "faithfulness_warn": 0.80, "faithfulness_crit": 0.60,
     "context_precision_warn": 0.70, "context_precision_crit": 0.50,
+    "hallucination_warn": 0.20, "hallucination_crit": 0.40,     # 1 − faithfulness; higher = worse
+    "retrieval_ms_warn": 1000.0, "retrieval_ms_crit": 3000.0,   # avg Chroma search latency
+    "gen_latency_ms_warn": 120000.0, "gen_latency_ms_crit": 300000.0,  # avg end-to-end generation
+    "token_eff_warn": 400.0, "token_eff_crit": 800.0,           # estimated context tokens / question
 }
 
 
@@ -455,13 +479,16 @@ async def rag_eval_summary(
     current_user: User = Depends(require_permission("system.view")),
 ):
     """RAG-quality dashboard data: configured flag, coverage, average scores (with
-    threshold states), and the most recently scored transactions."""
-    from models import RagSample
+    threshold states), retrieval call stats, generation latency, hallucination rate,
+    token efficiency, and the most recently scored transactions."""
+    from models import RagSample, PipelineSpan, PipelineRun
     from rag.scorer import is_configured
     from config import settings
 
-    total = await db.scalar(select(func.count()).select_from(RagSample))
-    scored = await db.scalar(select(func.count()).select_from(RagSample).where(RagSample.scored_at.isnot(None)))
+    # Count only scoreable rows (contexts present) — matches the filter the scorer uses,
+    # so "awaiting" reflects what can actually be scored, not stale/empty rows.
+    total = await db.scalar(select(func.count()).select_from(RagSample).where(RagSample.contexts.isnot(None)))
+    scored = await db.scalar(select(func.count()).select_from(RagSample).where(RagSample.scored_at.isnot(None), RagSample.contexts.isnot(None)))
     avg_f = await db.scalar(select(func.avg(RagSample.faithfulness)).where(RagSample.faithfulness.isnot(None)))
     avg_cp = await db.scalar(select(func.avg(RagSample.context_precision)).where(RagSample.context_precision.isnot(None)))
     recent = (await db.execute(
@@ -469,20 +496,83 @@ async def rag_eval_summary(
         .order_by(RagSample.scored_at.desc()).limit(20)
     )).scalars().all()
 
+    # ── Retrieval calls (all Chroma spans) ────────────────────────
+    r_row = (await db.execute(
+        select(func.count(), func.avg(PipelineSpan.duration_ms))
+        .where(PipelineSpan.service == "chroma")
+    )).one()
+    retrieval_calls = int(r_row[0] or 0)
+    avg_retrieval_ms = round(float(r_row[1]), 1) if r_row[1] is not None else None
+
+    # ── Avg end-to-end generation latency ────────────────────────
+    gen_lat = await db.scalar(
+        select(func.avg(
+            func.extract("epoch", PipelineRun.finished_at - PipelineRun.started_at) * 1000
+        ))
+        .where(PipelineRun.kind == "generation", PipelineRun.status == "completed",
+               PipelineRun.finished_at.isnot(None))
+    )
+    avg_gen_latency_ms = round(float(gen_lat), 0) if gen_lat is not None else None
+
     avg_f = round(float(avg_f), 3) if avg_f is not None else None
     avg_cp = round(float(avg_cp), 3) if avg_cp is not None else None
+
+    # ── Hallucination rate (1 − faithfulness) ────────────────────
+    hallucination_rate = round(1.0 - avg_f, 3) if avg_f is not None else None
+
+    # ── Token efficiency from real span tokens ────────────────────
+    # Join rag_samples to pipeline_spans via run_id; sum prompt + completion
+    # tokens across all OpenAI augmentation spans for each generation run, then
+    # divide by the number of questions produced. Falls back to None for samples
+    # that predate the token-capture feature (no prompt_tokens recorded yet).
+    tok_rows = (await db.execute(
+        select(
+            RagSample.id,
+            func.sum(PipelineSpan.prompt_tokens + PipelineSpan.completion_tokens).label("total_tokens"),
+            func.jsonb_array_length(RagSample.items).label("n_items"),
+        )
+        .join(PipelineSpan, PipelineSpan.run_id == RagSample.run_id)
+        .where(
+            RagSample.run_id.isnot(None),
+            RagSample.scored_at.isnot(None),
+            PipelineSpan.service == "openai",
+            PipelineSpan.prompt_tokens.isnot(None),
+        )
+        .group_by(RagSample.id)
+    )).all()
+
+    sample_tokens: dict[str, float] = {}
+    eff_vals: list[float] = []
+    for row in tok_rows:
+        n = int(row.n_items or 0)
+        tok_total = float(row.total_tokens or 0)
+        if n > 0 and tok_total > 0:
+            eff = round(tok_total / n, 1)
+            sample_tokens[str(row.id)] = eff
+            eff_vals.append(eff)
+    avg_token_efficiency = round(sum(eff_vals) / len(eff_vals), 1) if eff_vals else None
+
     return {
         "configured": is_configured(),
         "model": settings.RAG_SCORER_MODEL,
         "total": total or 0, "scored": scored or 0, "unscored": (total or 0) - (scored or 0),
         "avg_faithfulness": avg_f, "avg_context_precision": avg_cp,
+        "hallucination_rate": hallucination_rate,
+        "retrieval_calls": retrieval_calls, "avg_retrieval_ms": avg_retrieval_ms,
+        "avg_gen_latency_ms": avg_gen_latency_ms,
+        "avg_token_efficiency": avg_token_efficiency,
         "faithfulness_status": _state_low(avg_f, RAG_THRESHOLDS["faithfulness_warn"], RAG_THRESHOLDS["faithfulness_crit"]),
         "context_precision_status": _state_low(avg_cp, RAG_THRESHOLDS["context_precision_warn"], RAG_THRESHOLDS["context_precision_crit"]),
+        "hallucination_status": _state(hallucination_rate, RAG_THRESHOLDS["hallucination_warn"], RAG_THRESHOLDS["hallucination_crit"]),
+        "retrieval_latency_status": _state(avg_retrieval_ms, RAG_THRESHOLDS["retrieval_ms_warn"], RAG_THRESHOLDS["retrieval_ms_crit"]),
+        "gen_latency_status": _state(avg_gen_latency_ms, RAG_THRESHOLDS["gen_latency_ms_warn"], RAG_THRESHOLDS["gen_latency_ms_crit"]),
+        "token_efficiency_status": _state(avg_token_efficiency, RAG_THRESHOLDS["token_eff_warn"], RAG_THRESHOLDS["token_eff_crit"]),
         "thresholds": RAG_THRESHOLDS,
         "samples": [{
             "id": str(s.id), "topic": s.topic, "question_type": s.question_type,
             "information_source": s.information_source,
             "faithfulness": s.faithfulness, "context_precision": s.context_precision,
+            "token_efficiency": sample_tokens.get(str(s.id)),
             "rationale": s.rationale, "scored_at": iso_utc(s.scored_at),
         } for s in recent],
     }

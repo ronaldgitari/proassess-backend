@@ -14,5 +14,6 @@ from admin import router as admin_router
 from ops import router as ops_router
 from users import router as users_router
 from groups import router as groups_router
+from system_settings import router as system_settings_router
 
-__all__ = ["auth_router", "assessments_router", "knowledge_router", "admin_router", "ops_router", "users_router", "groups_router"]
+__all__ = ["auth_router", "assessments_router", "knowledge_router", "admin_router", "ops_router", "users_router", "groups_router", "system_settings_router"]

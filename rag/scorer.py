@@ -85,11 +85,12 @@ async def score_sample(query: str, contexts: list[str], items: list[dict]) -> di
 
     from services import pipeline_tracker as pt
     try:
-        async with pt.track_span("qwen", "chat.completion · rag-score", phase="score"):
+        async with pt.track_span("qwen", "chat.completion · rag-score", phase="score") as span:
             resp = await llm.ainvoke([
                 {"role": "system", "content": _SYSTEM},
                 {"role": "user", "content": prompt},
             ])
+            span.capture(resp)
         obj = extract_json_object(resp.content)
         return {
             "available": True,

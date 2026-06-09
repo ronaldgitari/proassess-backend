@@ -88,8 +88,9 @@ Domain: {domain}
 Return exactly 4 queries, one per line, no numbering or bullets. Each query should approach the topic from a different angle (definition, application, policy/regulation, best practice).
 """
     from services import pipeline_tracker as pt
-    async with pt.track_span("openai", f"chat.completion · {settings.OPENAI_CHAT_MODEL}", phase="retrieve", detail="query expansion"):
+    async with pt.track_span("openai", f"chat.completion · {settings.OPENAI_CHAT_MODEL}", phase="retrieve", detail="query expansion") as span:
         response = await llm.ainvoke(prompt)
+        span.capture(response)
     queries = [q.strip() for q in response.content.strip().split("\n") if q.strip()]
     queries = queries[:4]
     if not queries:

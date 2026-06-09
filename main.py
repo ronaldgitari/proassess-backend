@@ -11,7 +11,7 @@ from fastapi.responses import JSONResponse
 
 from config import settings
 from database import create_tables
-from api import auth_router, assessments_router, knowledge_router, admin_router, ops_router, users_router, groups_router
+from api import auth_router, assessments_router, knowledge_router, admin_router, ops_router, users_router, groups_router, system_settings_router
 
 # ─────────────────────────────────────────────────────────────────
 # Logging
@@ -85,13 +85,14 @@ async def unhandled_exception_handler(request: Request, exc: Exception):
 
 # ── Routers ───────────────────────────────────────────────────────
 
-app.include_router(auth_router,        prefix="/api/v1")
-app.include_router(assessments_router, prefix="/api/v1")
-app.include_router(knowledge_router,   prefix="/api/v1")
-app.include_router(admin_router,       prefix="/api/v1")
-app.include_router(ops_router,         prefix="/api/v1")
-app.include_router(users_router,       prefix="/api/v1")
-app.include_router(groups_router,      prefix="/api/v1")
+app.include_router(auth_router,            prefix="/api/v1")
+app.include_router(assessments_router,     prefix="/api/v1")
+app.include_router(knowledge_router,       prefix="/api/v1")
+app.include_router(admin_router,           prefix="/api/v1")
+app.include_router(ops_router,             prefix="/api/v1")
+app.include_router(users_router,           prefix="/api/v1")
+app.include_router(groups_router,          prefix="/api/v1")
+app.include_router(system_settings_router, prefix="/api/v1")
 
 
 # ── Health check ──────────────────────────────────────────────────

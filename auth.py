@@ -61,8 +61,17 @@ async def me(
     db: AsyncSession = Depends(get_db),
 ):
     from services.permissions import get_effective_permissions
+    from models.user import Organisation
+    from system_settings import effective_settings as compute_effective_settings
+
     out = UserOut.model_validate(current_user)
     out.permissions = await get_effective_permissions(current_user, db)
+
+    org_result = await db.execute(select(Organisation).where(Organisation.id == current_user.org_id))
+    org = org_result.scalar_one_or_none()
+    org_settings = (org.settings or {}) if org else {}
+    out.effective_settings = compute_effective_settings(org_settings, current_user.settings)
+
     return out
 
 

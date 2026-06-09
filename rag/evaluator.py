@@ -27,6 +27,10 @@ class AnswerResult:
     is_correct: bool
     score: float           # 0–100
     ai_feedback: str | None = None
+    # Self-correcting eval fields (None for MCQ / single-pass paths)
+    eval_attempts: int | None = None
+    eval_flagged: bool = False
+    eval_scratchpad: list | None = None
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -91,9 +95,15 @@ async def evaluate_written(
     question_text: str,
     model_answer: str,
     staff_response: str,
+    explanation: str | None = None,
+    question_type: str = "written",   # "written" | "coding" | "scenario"
 ) -> AnswerResult:
     """
-    Use GPT-4o to score a written response against the model answer.
+    Score a written/coding/scenario response against the model answer.
+
+    When settings.ENABLE_SELF_CORRECTING_EVAL is True and the question type is
+    written, coding, or scenario, the Maker → Checker → Router loop is used.
+    Falls back to a single-pass GPT call on loop errors or when disabled.
     Returns a score (0–100) and qualitative feedback.
     """
     if not staff_response or not staff_response.strip():
@@ -104,6 +114,40 @@ async def evaluate_written(
             ai_feedback="No response provided.",
         )
 
+    # ── Self-correcting path ──────────────────────────────────────
+    if settings.ENABLE_SELF_CORRECTING_EVAL and question_type in ("written", "coding", "scenario"):
+        try:
+            from rag.self_correcting_evaluator import CaseFile, evaluate_with_correction
+            case_file = CaseFile(
+                question_text=question_text,
+                candidate_answer=staff_response,
+                correct_reference=model_answer,
+                explanation=explanation or "",
+                question_type=question_type,
+            )
+            result = await evaluate_with_correction(case_file)
+            logger.debug(
+                "Self-correcting eval Q%s: score=%.0f correct=%s attempts=%s flagged=%s",
+                question_id, result["score"], result["is_correct"],
+                result["eval_attempts"], result["eval_flagged"],
+            )
+            return AnswerResult(
+                question_id=question_id,
+                is_correct=result["is_correct"],
+                score=result["score"],
+                ai_feedback=result["feedback"],
+                eval_attempts=result["eval_attempts"],
+                eval_flagged=result["eval_flagged"],
+                eval_scratchpad=result["eval_scratchpad"] or None,
+            )
+        except Exception as e:
+            logger.error(
+                "Self-correcting eval failed for Q%s, falling back to single-pass: %s",
+                question_id, e,
+            )
+            # Fall through to single-pass below
+
+    # ── Single-pass fallback ──────────────────────────────────────
     llm = ChatOpenAI(
         model=settings.OPENAI_CHAT_MODEL,
         temperature=0.1,    # low temp for consistent scoring
@@ -125,8 +169,9 @@ async def evaluate_written(
     import json, re
     from services import pipeline_tracker as pt
 
-    async with pt.track_span("openai", f"chat.completion · {settings.OPENAI_CHAT_MODEL}", phase="score", detail="written/coding evaluation"):
+    async with pt.track_span("openai", f"chat.completion · {settings.OPENAI_CHAT_MODEL}", phase="score", detail="written/coding evaluation") as span:
         response = await llm.ainvoke(messages)
+        span.capture(response)
     raw = response.content.strip()
 
     # Strip markdown fences if present

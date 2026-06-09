@@ -56,6 +56,12 @@ class Settings(BaseSettings):
     # context the grader sees → spurious insufficient_context failures.
     MAX_CONCURRENT_GENERATIONS: int = 3
 
+    # Self-correcting evaluation (Maker → Checker → Router loop)
+    ENABLE_SELF_CORRECTING_EVAL: bool = True
+    EVAL_MAKER_MODEL: str = "gpt-4o-mini"
+    EVAL_CHECKER_MODEL: str = "gpt-4o"
+    MAX_EVAL_ATTEMPTS: int = 3
+
     # Web research for rich scenario feedback (case-study assessments).
     # Provider plug-in for credible external sources cited in AI feedback.
     # Supported: "" (disabled → grounded-only feedback) | "tavily".

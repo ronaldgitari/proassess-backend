@@ -187,11 +187,12 @@ async def grade_context(
     from services import pipeline_tracker as pt
     try:
         async with pt.track_span("openai", f"chat.completion · grade ({settings.OPENAI_GRADER_MODEL})",
-                                 phase="grade", detail="grade retrieved context"):
+                                 phase="grade", detail="grade retrieved context") as span:
             response = await llm.ainvoke([
                 {"role": "system", "content": GRADE_SYSTEM_PROMPT},
                 {"role": "user", "content": user_prompt},
             ])
+            span.capture(response)
         result = extract_json_object(response.content)
     except Exception as e:
         logger.warning("Grader call/parse failed (%s) — failing open to 'sufficient'", e)

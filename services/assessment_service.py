@@ -51,6 +51,32 @@ async def create_assessment(
 ) -> Assessment:
     """Create a draft assessment and trigger async question generation."""
 
+    # ── Duplicate-name guard ──────────────────────────────────────
+    # Reject if an active (deployed/active) non-archived assessment with the
+    # exact same name already exists in this org. Prevents LMs accidentally
+    # creating the same assessment twice and confusing the audience.
+    conflict_row = (await db.execute(
+        select(Assessment).where(
+            Assessment.org_id == current_user.org_id,
+            Assessment.name == req.name,
+            Assessment.status.in_([AssessmentStatus.DEPLOYED, AssessmentStatus.ACTIVE]),
+            Assessment.is_archived == False,  # noqa: E712
+        )
+    )).scalar_one_or_none()
+    if conflict_row:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": (
+                    f"An active assessment named \"{req.name}\" already exists in your organisation. "
+                    "Rename this assessment or cancel/archive the existing one first."
+                ),
+                "conflict_id": str(conflict_row.id),
+                "conflict_name": conflict_row.name,
+                "conflict_status": conflict_row.status.value,
+            },
+        )
+
     # Department-charge restriction: a creator without org-wide authority
     # (`users.manage` — i.e. an LM) may only target departments they line-manage.
     from models import TargetType
@@ -462,6 +488,7 @@ async def submit_assessment(
             "question_text": q.text,
             "correct_answer_index": q.correct_answer_index,
             "correct_answer_text": q.correct_answer_text,
+            "explanation": q.explanation,
             "given_index": given_index,
             "given_text": given_text,
         })
@@ -494,6 +521,8 @@ async def submit_assessment(
                     question_text=payload["question_text"],
                     model_answer=payload["correct_answer_text"] or "",
                     staff_response=payload["given_text"] or "",
+                    explanation=payload.get("explanation") or "",
+                    question_type=payload["question_type"],
                 )
             answer_results.append(r)
         await pt.finish_step(run_id, "score", "ok", f"{len(answer_results)} answers scored")
@@ -511,6 +540,10 @@ async def submit_assessment(
                 child.is_correct = r.is_correct
                 child.score = r.score
                 child.ai_feedback = r.ai_feedback
+                # Self-correcting eval metadata (None for MCQ / single-pass)
+                child.eval_attempts = r.eval_attempts
+                child.eval_flagged = r.eval_flagged if r.eval_flagged else False
+                child.eval_scratchpad = r.eval_scratchpad
                 db.add(child)
 
         # Update session summary
